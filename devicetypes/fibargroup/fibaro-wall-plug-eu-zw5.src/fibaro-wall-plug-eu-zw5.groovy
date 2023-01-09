@@ -47,16 +47,17 @@ metadata {
 	preferences {
 		parameterMap().each {
 			input (
-					title: "${it.num}. ${it.title}",
+					title: "${it.title}",
 					description: it.descr,
 					type: "paragraph",
 					element: "paragraph"
 			)
-
+			def defVal = it.def as Integer
+			def descrDefVal = it.options ? it.options.get(defVal) : defVal
 			input (
 					name: it.key,
 					title: null,
-					description: "Default: $it.def" ,
+					description: "$descrDefVal",
 					type: it.type,
 					options: it.options,
 					range: (it.min != null && it.max != null) ? "${it.min}..${it.max}" : null,
@@ -79,6 +80,10 @@ def off() {
 }
 
 def reset() {
+	resetEnergyMeter()
+}
+
+def resetEnergyMeter() {
 	def cmds = []
 	cmds << zwave.meterV3.meterReset()
 	cmds << zwave.meterV3.meterGet(scale: 0)

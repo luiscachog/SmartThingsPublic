@@ -20,10 +20,13 @@ metadata {
 		capability "Actuator"
 		capability "Sensor"
 		capability "Health Check"
+		capability "Configuration"
 
 		command "reset"
 
 		fingerprint mfr: "0159", prod: "0002", model: "0051", deviceJoinName: "Qubino Switch 1" //Qubino Flush 2 Relay
+		fingerprint mfr: "0159", prod: "0002", model: "0052", deviceJoinName: "Qubino Switch" //Qubino Flush 1 Relay 
+		fingerprint mfr: "0159", prod: "0002", model: "0053", deviceJoinName: "Qubino Switch", mnmn: "SmartThings", vid: "generic-switch" //Qubino Flush 1D Relay
 	}
 
 	tiles(scale: 2) {
@@ -70,8 +73,13 @@ metadata {
 }
 
 def installed() {
-	state.numberOfSwitches = 2
-	if (!childDevices) {
+	if (zwaveInfo?.model.equals("0051")) {
+		state.numberOfSwitches = 2
+	} else {
+		state.numberOfSwitches = 1
+	}
+	
+ 	if (!childDevices && state.numberOfSwitches > 1) {
 		addChildSwitches(state.numberOfSwitches)
 	}
 	sendEvent(name: "checkInterval", value: 2 * 15 * 60 + 2 * 60, displayed: false, data: [protocol: "zwave", hubHardwareId: device.hub.hardwareID])
@@ -85,15 +93,19 @@ def installed() {
 		state.currentPreferencesState."$it.key".status = "synced"
 	}
 	// Preferences template end
+	response([
+			refresh((1..state.numberOfSwitches).toList()),
+			addToAssociationGroupIfNeeded()
+	].flatten())
 }
 
 def updated() {
-	if (!childDevices) {
+	if (!childDevices && state.numberOfSwitches > 1) {
 		addChildSwitches(state.numberOfSwitches)
 	}
 	// Preferences template begin
 	parameterMap.each {
-		if (isPreferenceChanged(it)) {
+		if (isPreferenceChanged(it) && !excludeParameterFromSync(it)) {
 			log.debug "Preference ${it.key} has been updated from value: ${state.currentPreferencesState."$it.key".value} to ${settings."$it.key"}"
 			state.currentPreferencesState."$it.key".status = "syncPending"
 		} else if (!state.currentPreferencesState."$it.key".value) {
@@ -102,6 +114,49 @@ def updated() {
 	}
 	syncConfiguration()
 	// Preferences template end
+}
+
+def excludeParameterFromSync(preference){
+	def exclude = false
+	if (preference.key == "outputQ2SwitchSelection") {
+		if (zwaveInfo?.model?.equals("0052") || zwaveInfo?.model?.equals("0053")) {
+			exclude = true
+		}
+	}
+
+	if (exclude) {
+		log.warn "Preference no ${preference.parameterNumber} - ${preference.key} is not supported by this device"
+	}
+	return exclude
+}
+
+def configure() {
+	def cmds = []
+
+	if (zwaveInfo?.model?.equals("0051")) {
+		// parameters 40 and 41 - power consumption reporting threshold for Q1 and Q2 loads (respectively) - 5 %
+		cmds += encap(zwave.configurationV1.configurationSet(parameterNumber: 40, size: 1, scaledConfigurationValue: 5))
+		cmds += encap(zwave.configurationV1.configurationSet(parameterNumber: 41, size: 1, scaledConfigurationValue: 5))
+		// parameters 42 and 43 - power consumption reporting time threshold for Q1 and Q2 (respectively) - 5 minutes
+		// additionally, manual states that default value for below parameters is 0, which disables power reporting
+		cmds += encap(zwave.configurationV1.configurationSet(parameterNumber: 42, size: 2, scaledConfigurationValue: 300))
+		cmds += encap(zwave.configurationV1.configurationSet(parameterNumber: 43, size: 2, scaledConfigurationValue: 300))
+	} else if (zwaveInfo?.model?.equals("0052")) {
+		//parameter 40 - power reporting threshold for Q1 load - 75%
+		cmds += encap(zwave.configurationV1.configurationSet(parameterNumber: 40, size: 1, scaledConfigurationValue: 75))
+	}
+
+	delayBetween(cmds, 500)
+}
+
+def addToAssociationGroupIfNeeded() {
+	def cmds = []
+	if (zwaveInfo?.model?.equals("0052")) {
+		//Hub automatically adds device to multiChannelAssosciationGroup and this needs to be removed
+		cmds += encap(zwave.multiChannelAssociationV2.multiChannelAssociationRemove(groupingIdentifier: 1, nodeId:[])) 
+		cmds += encap(zwave.associationV2.associationSet(groupingIdentifier: 1, nodeId: [zwaveHubNodeId]))
+	}
+	cmds
 }
 
 private syncConfiguration() {
@@ -217,9 +272,17 @@ def zwaveEvent(physicalgraph.zwave.commands.switchbinaryv1.SwitchBinaryReport cm
 	changeSwitch(ep, cmd)
 }
 
+def defaultEndpoint() {
+	if (zwaveInfo?.model?.equals("0052")) {
+		return null
+	} else {
+		return 1
+	}
+}
+
 private changeSwitch(endpoint, cmd) {
 	def value = cmd.value ? "on" : "off"
-	if (endpoint == 1) {
+	if (endpoint == defaultEndpoint()) {
 		createEvent(name: "switch", value: value, isStateChange: true, descriptionText: "Switch ${endpoint} is ${value}")
 	} else if (endpoint) {
 		String childDni = "${device.deviceNetworkId}:$endpoint"
@@ -229,14 +292,24 @@ private changeSwitch(endpoint, cmd) {
 }
 
 def zwaveEvent(physicalgraph.zwave.commands.meterv3.MeterReport cmd, ep = null) {
+	def result = []
+
 	log.debug "Meter ${cmd}" + (ep ? " from endpoint $ep" : "")
-	if (ep == 1) {
-		createEvent(createMeterEventMap(cmd))
+
+	if (ep == defaultEndpoint()) {
+		result << createEvent(createMeterEventMap(cmd))
 	} else if (ep) {
 		String childDni = "${device.deviceNetworkId}:$ep"
 		def child = childDevices.find { it.deviceNetworkId == childDni }
+
 		child?.sendEvent(createMeterEventMap(cmd))
 	}
+	// Query energy when we receive power reports
+	if (cmd.scale == 2) {
+		result << response(encap(zwave.meterV3.meterGet(scale: 0x00), ep))
+	}
+
+	result
 }
 
 private createMeterEventMap(cmd) {
@@ -278,6 +351,11 @@ def zwaveEvent(physicalgraph.zwave.commands.sensormultilevelv5.SensorMultilevelR
 	createEvent(map)
 }
 
+def zwaveEvent(physicalgraph.zwave.commands.basicv1.BasicSet cmd, ep = null) { 
+	log.debug "Basic ${cmd}" + (ep ? " from endpoint $ep" : "")
+	changeSwitch(ep, cmd)
+}
+
 def zwaveEvent(physicalgraph.zwave.Command cmd, ep) {
 	log.warn "Unhandled ${cmd}" + (ep ? " from endpoint $ep" : "")
 }
@@ -299,10 +377,10 @@ def childOnOff(deviceNetworkId, value) {
 	if (switchId != null) sendHubCommand onOffCmd(value, switchId)
 }
 
-private onOffCmd(value, endpoint = 1) {
+private onOffCmd(value, endpoint = defaultEndpoint()) {
 	delayBetween([
 			encap(zwave.basicV1.basicSet(value: value), endpoint),
-			encap(zwave.basicV1.basicGet(), endpoint),
+			encap(zwave.basicV1.basicGet(), endpoint)
 	])
 }
 
@@ -343,6 +421,10 @@ def childReset(deviceNetworkId) {
 		log.debug "Child reset switchId: ${switchId}"
 		sendHubCommand reset(switchId)
 	}
+}
+
+def resetEnergyMeter() {
+	reset(1)
 }
 
 def reset(endpoint = 1) {
@@ -446,6 +528,6 @@ private getParameterMap() {[
 						0: "When system is turned off the output is 0V (NC).",
 						1: "When system is turned off the output is 230V (NO).",
 				],
-				description: "Set value means the type of the device that is connected to the Q2 output. The device type can be normally open (NO) or normally close (NC).  "
+				description: "(Only for Qubino Flush 2 Relay) Set value means the type of the device that is connected to the Q2 output. The device type can be normally open (NO) or normally close (NC).  "
 		]
 ]}

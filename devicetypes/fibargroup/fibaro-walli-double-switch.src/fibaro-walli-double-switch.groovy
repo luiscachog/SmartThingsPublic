@@ -346,7 +346,7 @@ private onOffCmd(value, endpoint = 1) {
 	delayBetween([
 		encap(zwave.basicV1.basicSet(value: value), endpoint),
 		encap(zwave.basicV1.basicGet(), endpoint)
-	])
+	], 1000)
 }
 
 private refreshAll(includeMeterGet = true) {
@@ -392,6 +392,10 @@ def childReset(deviceNetworkId = null) {
 		log.debug "Child reset switchId: ${switchId}"
 		sendHubCommand reset(switchId)
 	}
+}
+
+def resetEnergyMeter() {
+	reset(1)
 }
 
 def reset(endpoint = 1) {
